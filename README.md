@@ -17,9 +17,14 @@ cargo install ghelpr
 ## Usage
 
 ```
-ghelpr unresolved <pr> [--owner <owner>] [--repo <repo>] [--include-outdated]
+ghelpr comments <pr> [--owner <owner>] [--repo <repo>] [--all] [--full]
 ```
 
-Returns unresolved review threads as JSON. Owner and repo are inferred from the current git remote by default.
+Returns review threads as JSON. By default, only unresolved threads are shown with a summary of each comment.
+
+- `--all` - include resolved threads
+- `--full` - include full details (diff hunks, review state, line positions, etc.)
+
+Owner and repo are inferred from the current git remote by default.
 
 Auth is resolved from `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token` (in that order).
