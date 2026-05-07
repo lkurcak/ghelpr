@@ -6,6 +6,14 @@ use std::process::Command;
 #[derive(Parser)]
 #[command(name = "ghelpr", about = "GitHub PR helper")]
 struct Cli {
+    /// Repository owner (inferred from git remote if omitted)
+    #[arg(short, long, global = true)]
+    owner: Option<String>,
+
+    /// Repository name (inferred from git remote if omitted)
+    #[arg(short, long, global = true)]
+    repo: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -17,20 +25,12 @@ enum Commands {
         /// Pull request number
         pr: u64,
 
-        /// Repository owner (inferred from git remote if omitted)
-        #[arg(long)]
-        owner: Option<String>,
-
-        /// Repository name (inferred from git remote if omitted)
-        #[arg(long)]
-        repo: Option<String>,
-
         /// Include all comments (resolved and unresolved)
-        #[arg(long, default_value_t = false)]
+        #[arg(short, long, default_value_t = false)]
         all: bool,
 
         /// Include full details (diff hunks, review info, line positions, etc.)
-        #[arg(long, default_value_t = false)]
+        #[arg(short, long, default_value_t = false)]
         full: bool,
     },
 }
@@ -560,12 +560,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Comments {
             pr,
-            owner,
-            repo,
             all,
             full,
         } => {
-            let (resolved_owner, resolved_repo) = match (owner, repo) {
+            let (resolved_owner, resolved_repo) = match (cli.owner, cli.repo) {
                 (Some(o), Some(r)) => (o, r),
                 (None, None) => parse_owner_repo_from_remote()?,
                 _ => bail!("Specify both --owner and --repo, or neither (to infer from git)."),
