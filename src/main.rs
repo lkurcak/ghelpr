@@ -12,8 +12,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show unresolved review comments for a pull request
-    Unresolved {
+    /// Show review comments for a pull request
+    Comments {
         /// Pull request number
         pr: u64,
 
@@ -25,9 +25,13 @@ enum Commands {
         #[arg(long)]
         repo: Option<String>,
 
-        /// Also include outdated (stale) threads
+        /// Include all comments (resolved and unresolved)
         #[arg(long, default_value_t = false)]
-        include_outdated: bool,
+        all: bool,
+
+        /// Include full details (diff hunks, review info, line positions, etc.)
+        #[arg(long, default_value_t = false)]
+        full: bool,
     },
 }
 
@@ -113,10 +117,44 @@ fn split_owner_repo(s: &str) -> Result<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
-// GraphQL types
+// GraphQL queries
 // ---------------------------------------------------------------------------
 
-const REVIEW_THREADS_QUERY: &str = r#"
+const REVIEW_THREADS_QUERY_SUMMARY: &str = r#"
+query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          startLine
+          comments(first: 100) {
+            nodes {
+              body
+              createdAt
+              author { login }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+}
+"#;
+
+const REVIEW_THREADS_QUERY_FULL: &str = r#"
 query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
@@ -173,6 +211,10 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// GraphQL response types (full, superset - optional fields handle both modes)
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize, Debug)]
 struct GqlResponse {
     data: Option<GqlData>,
@@ -201,14 +243,14 @@ struct GqlPullRequest {
     review_threads: GqlConnection<GqlReviewThread>,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlConnection<T> {
     nodes: Vec<T>,
     #[serde(rename = "pageInfo")]
     page_info: GqlPageInfo,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlPageInfo {
     #[serde(rename = "hasNextPage")]
     has_next_page: bool,
@@ -216,7 +258,7 @@ struct GqlPageInfo {
     end_cursor: Option<String>,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlReviewThread {
     id: String,
     #[serde(rename = "isResolved")]
@@ -242,7 +284,7 @@ struct GqlReviewThread {
     comments: GqlConnection<GqlComment>,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlComment {
     #[serde(rename = "databaseId")]
     database_id: Option<u64>,
@@ -251,7 +293,7 @@ struct GqlComment {
     created_at: String,
     #[serde(rename = "updatedAt")]
     updated_at: Option<String>,
-    url: String,
+    url: Option<String>,
     state: Option<String>,
     outdated: Option<bool>,
     #[serde(rename = "diffHunk")]
@@ -276,17 +318,163 @@ struct GqlAuthor {
     login: String,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlReplyRef {
     #[serde(rename = "databaseId")]
     database_id: Option<u64>,
 }
 
-#[derive(Deserialize, Debug, serde::Serialize)]
+#[derive(Deserialize, Debug)]
 struct GqlReview {
     state: Option<String>,
     body: Option<String>,
     author: Option<GqlAuthor>,
+}
+
+// ---------------------------------------------------------------------------
+// Output types (separate for summary vs full)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct SummaryThread {
+    path: String,
+    line: Option<u64>,
+    start_line: Option<u64>,
+    is_resolved: bool,
+    is_outdated: bool,
+    comments: Vec<SummaryComment>,
+}
+
+#[derive(serde::Serialize)]
+struct SummaryComment {
+    author: String,
+    created_at: String,
+    body: String,
+}
+
+#[derive(serde::Serialize)]
+struct FullThread {
+    id: String,
+    path: String,
+    line: Option<u64>,
+    start_line: Option<u64>,
+    original_line: Option<u64>,
+    original_start_line: Option<u64>,
+    is_resolved: bool,
+    is_outdated: bool,
+    diff_side: Option<String>,
+    start_diff_side: Option<String>,
+    subject_type: Option<String>,
+    resolved_by: Option<String>,
+    comments: Vec<FullComment>,
+}
+
+#[derive(serde::Serialize)]
+struct FullComment {
+    database_id: Option<u64>,
+    author: String,
+    created_at: String,
+    updated_at: Option<String>,
+    url: Option<String>,
+    state: Option<String>,
+    outdated: Option<bool>,
+    diff_hunk: Option<String>,
+    path: Option<String>,
+    line: Option<u64>,
+    start_line: Option<u64>,
+    original_line: Option<u64>,
+    original_start_line: Option<u64>,
+    reply_to_id: Option<u64>,
+    review_state: Option<String>,
+    review_body: Option<String>,
+    review_author: Option<String>,
+    body: String,
+}
+
+// ---------------------------------------------------------------------------
+// Conversion
+// ---------------------------------------------------------------------------
+
+fn to_summary(thread: &GqlReviewThread) -> SummaryThread {
+    SummaryThread {
+        path: thread.path.clone(),
+        line: thread.line,
+        start_line: thread.start_line,
+        is_resolved: thread.is_resolved,
+        is_outdated: thread.is_outdated,
+        comments: thread
+            .comments
+            .nodes
+            .iter()
+            .map(|c| SummaryComment {
+                author: c
+                    .author
+                    .as_ref()
+                    .map(|a| a.login.clone())
+                    .unwrap_or_else(|| "ghost".to_string()),
+                created_at: c.created_at.clone(),
+                body: c.body.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn to_full(thread: &GqlReviewThread) -> FullThread {
+    FullThread {
+        id: thread.id.clone(),
+        path: thread.path.clone(),
+        line: thread.line,
+        start_line: thread.start_line,
+        original_line: thread.original_line,
+        original_start_line: thread.original_start_line,
+        is_resolved: thread.is_resolved,
+        is_outdated: thread.is_outdated,
+        diff_side: thread.diff_side.clone(),
+        start_diff_side: thread.start_diff_side.clone(),
+        subject_type: thread.subject_type.clone(),
+        resolved_by: thread
+            .resolved_by
+            .as_ref()
+            .map(|a| a.login.clone()),
+        comments: thread
+            .comments
+            .nodes
+            .iter()
+            .map(|c| FullComment {
+                database_id: c.database_id,
+                author: c
+                    .author
+                    .as_ref()
+                    .map(|a| a.login.clone())
+                    .unwrap_or_else(|| "ghost".to_string()),
+                created_at: c.created_at.clone(),
+                updated_at: c.updated_at.clone(),
+                url: c.url.clone(),
+                state: c.state.clone(),
+                outdated: c.outdated,
+                diff_hunk: c.diff_hunk.clone(),
+                path: c.path.clone(),
+                line: c.line,
+                start_line: c.start_line,
+                original_line: c.original_line,
+                original_start_line: c.original_start_line,
+                reply_to_id: c.reply_to.as_ref().and_then(|r| r.database_id),
+                review_state: c
+                    .pull_request_review
+                    .as_ref()
+                    .and_then(|r| r.state.clone()),
+                review_body: c
+                    .pull_request_review
+                    .as_ref()
+                    .and_then(|r| r.body.clone()),
+                review_author: c
+                    .pull_request_review
+                    .as_ref()
+                    .and_then(|r| r.author.as_ref().map(|a| a.login.clone())),
+                body: c.body.clone(),
+            })
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +487,14 @@ async fn fetch_review_threads(
     owner: &str,
     repo: &str,
     pr: u64,
+    full: bool,
 ) -> Result<Vec<GqlReviewThread>> {
+    let query = if full {
+        REVIEW_THREADS_QUERY_FULL
+    } else {
+        REVIEW_THREADS_QUERY_SUMMARY
+    };
+
     let mut all_threads = Vec::new();
     let mut cursor: Option<String> = None;
 
@@ -312,7 +507,7 @@ async fn fetch_review_threads(
         });
 
         let body = serde_json::json!({
-            "query": REVIEW_THREADS_QUERY,
+            "query": query,
             "variables": variables,
         });
 
@@ -355,15 +550,6 @@ async fn fetch_review_threads(
 }
 
 // ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-fn print_threads_json(threads: &[GqlReviewThread]) {
-    let json = serde_json::to_string_pretty(threads).expect("Failed to serialize to JSON");
-    println!("{json}");
-}
-
-// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -372,11 +558,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Unresolved {
+        Commands::Comments {
             pr,
             owner,
             repo,
-            include_outdated,
+            all,
+            full,
         } => {
             let (resolved_owner, resolved_repo) = match (owner, repo) {
                 (Some(o), Some(r)) => (o, r),
@@ -388,16 +575,29 @@ async fn main() -> Result<()> {
             let client = reqwest::Client::new();
 
             let all_threads =
-                fetch_review_threads(&client, &token, &resolved_owner, &resolved_repo, pr)
+                fetch_review_threads(&client, &token, &resolved_owner, &resolved_repo, pr, full)
                     .await?;
 
-            let unresolved: Vec<_> = all_threads
-                .into_iter()
-                .filter(|t| !t.is_resolved)
-                .filter(|t| include_outdated || !t.is_outdated)
-                .collect();
+            let threads: Vec<_> = if all {
+                all_threads
+            } else {
+                all_threads
+                    .into_iter()
+                    .filter(|t| !t.is_resolved)
+                    .collect()
+            };
 
-            print_threads_json(&unresolved);
+            if full {
+                let output: Vec<_> = threads.iter().map(to_full).collect();
+                let json =
+                    serde_json::to_string_pretty(&output).expect("Failed to serialize to JSON");
+                println!("{json}");
+            } else {
+                let output: Vec<_> = threads.iter().map(to_summary).collect();
+                let json =
+                    serde_json::to_string_pretty(&output).expect("Failed to serialize to JSON");
+                println!("{json}");
+            }
         }
     }
 
