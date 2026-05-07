@@ -4,6 +4,9 @@ on:
   push:
     tags: ['[0-9]+.[0-9]+.[0-9]+']
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -17,13 +20,9 @@ jobs:
       - name: Test release
         run: cargo test --release --verbose
 
-  publish:
+  create-release:
     needs: test
     runs-on: ubuntu-latest
-    environment: crates-io
-    permissions:
-      id-token: write
-      contents: write
     steps:
       - uses: actions/checkout@v6
       - name: Get the release version from the tag
@@ -34,28 +33,123 @@ jobs:
             echo "version does not match Cargo.toml" >&2
             exit 1
           fi
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$VERSION" --draft --verify-tag --title "$VERSION"
+    outputs:
+      version: ${{ env.VERSION }}
+
+  cargo-publish:
+    needs: create-release
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish to crates.io
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Create GitHub release
-        run: gh release create "$VERSION" --generate-notes --latest
-        env:
-          GH_TOKEN: ${{ github.token }}
 
   update-homebrew:
-    needs: publish
+    needs: create-release
     runs-on: macos-latest
     steps:
       - name: Update Homebrew formula
         env:
           HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          version="${{ github.ref_name }}"
+          version="${{ needs.create-release.outputs.version }}"
           brew tap lkurcak/tap
           brew bump-formula-pr \
             --no-browse \
             --version="$version" \
             lkurcak/tap/ghelpr
+
+  build-release:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            rustflags: '-C target-feature=+crt-static'
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            rustflags: '-C target-feature=+crt-static'
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
+        run: |
+          cargo build --verbose --release --target ${{ matrix.target }}
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            bin="target/${{ matrix.target }}/release/ghelpr.exe"
+          else
+            bin="target/${{ matrix.target }}/release/ghelpr"
+          fi
+          echo "BIN=$bin" >> $GITHUB_ENV
+
+      - name: Determine archive name
+        shell: bash
+        run: |
+          version="${{ needs.create-release.outputs.version }}"
+          echo "ARCHIVE=ghelpr-$version-${{ matrix.target }}" >> $GITHUB_ENV
+
+      - name: Create archive directory
+        shell: bash
+        run: |
+          mkdir -p "$ARCHIVE"
+          cp "$BIN" "$ARCHIVE"/
+          cp LICENSE "$ARCHIVE"/
+          cp README.md "$ARCHIVE"/
+
+      - name: Build archive (Windows)
+        shell: bash
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd "$ARCHIVE"
+          7z a "../$ARCHIVE.zip" *
+          cd ..
+          echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
+
+      - name: Build archive (Unix)
+        shell: bash
+        if: matrix.os != 'windows-latest'
+        run: |
+          tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+          echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload release archive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          version="${{ needs.create-release.outputs.version }}"
+          gh release upload "$version" "$ASSET"

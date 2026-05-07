@@ -14,6 +14,8 @@ or
 cargo install ghelpr
 ```
 
+or download a prebuilt binary from [GitHub Releases](https://github.com/lkurcak/ghelpr/releases).
+
 ## Usage
 
 ```
