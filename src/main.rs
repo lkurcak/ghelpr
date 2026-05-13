@@ -33,6 +33,13 @@ enum Commands {
         #[arg(short, long, default_value_t = false)]
         full: bool,
     },
+
+    /// Show Copilot premium request quota and usage
+    Quota {
+        /// Output raw JSON response
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -66,6 +73,24 @@ fn get_token() -> Result<String> {
     bail!(
         "No GitHub token found. Set GH_TOKEN or GITHUB_TOKEN, \
          or log in with `gh auth login`."
+    )
+}
+
+fn get_session_cookie() -> Result<String> {
+    if let Ok(cookie) = std::env::var("GITHUB_SESSION_COOKIE") {
+        if !cookie.is_empty() {
+            return Ok(cookie);
+        }
+    }
+    bail!(
+        "No GitHub session cookie found.\n\n\
+         Set the GITHUB_SESSION_COOKIE environment variable to your github.com `user_session` cookie value.\n\n\
+         To get it:\n  \
+         1. Open https://github.com/settings/copilot/features in your browser\n  \
+         2. Open DevTools (F12) > Application > Cookies > github.com\n  \
+         3. Copy the value of the `user_session` cookie\n  \
+         4. Set it:  export GITHUB_SESSION_COOKIE=\"<value>\"\n\n\
+         The cookie typically lasts ~2 weeks and is refreshed as you use GitHub."
     )
 }
 
@@ -550,6 +575,86 @@ async fn fetch_review_threads(
 }
 
 // ---------------------------------------------------------------------------
+// Copilot entitlement types
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Debug, serde::Serialize)]
+struct CopilotEntitlement {
+    #[serde(rename = "licenseType")]
+    license_type: Option<String>,
+    quotas: Option<CopilotQuotas>,
+    plan: Option<String>,
+    trial: Option<CopilotTrial>,
+}
+
+#[derive(Deserialize, Debug, serde::Serialize)]
+struct CopilotQuotas {
+    limits: Option<CopilotLimits>,
+    remaining: Option<CopilotRemaining>,
+    #[serde(rename = "resetDate")]
+    reset_date: Option<String>,
+    #[serde(rename = "overagesEnabled")]
+    overages_enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, serde::Serialize)]
+struct CopilotLimits {
+    #[serde(rename = "premiumInteractions")]
+    premium_interactions: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, serde::Serialize)]
+struct CopilotRemaining {
+    #[serde(rename = "premiumInteractions")]
+    premium_interactions: Option<u64>,
+    #[serde(rename = "chatPercentage")]
+    chat_percentage: Option<f64>,
+    #[serde(rename = "premiumInteractionsPercentage")]
+    premium_interactions_percentage: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, serde::Serialize)]
+struct CopilotTrial {
+    eligible: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// Copilot entitlement API call
+// ---------------------------------------------------------------------------
+
+async fn fetch_copilot_quota(
+    client: &reqwest::Client,
+    session_cookie: &str,
+) -> Result<CopilotEntitlement> {
+    let resp = client
+        .get("https://github.com/github-copilot/chat/entitlement")
+        .header("Accept", "application/json")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header("github-verified-fetch", "true")
+        .header("User-Agent", "Mozilla/5.0 (compatible; ghelpr)")
+        .header("Cookie", format!("user_session={session_cookie}"))
+        .send()
+        .await
+        .context("Failed to fetch Copilot entitlement")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            bail!(
+                "GitHub returned 404. Your session cookie is likely expired or invalid.\n\
+                 Refresh it from your browser and update GITHUB_SESSION_COOKIE."
+            );
+        }
+        bail!("GitHub returned {status}: {text}");
+    }
+
+    resp.json()
+        .await
+        .context("Failed to parse Copilot entitlement response")
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -595,6 +700,59 @@ async fn main() -> Result<()> {
                 let json =
                     serde_json::to_string_pretty(&output).expect("Failed to serialize to JSON");
                 println!("{json}");
+            }
+        }
+
+        Commands::Quota { json } => {
+            let session_cookie = get_session_cookie()?;
+            let client = reqwest::Client::new();
+            let entitlement = fetch_copilot_quota(&client, &session_cookie).await?;
+
+            if json {
+                let output = serde_json::to_string_pretty(&entitlement)
+                    .expect("Failed to serialize to JSON");
+                println!("{output}");
+            } else {
+                let plan = entitlement.plan.as_deref().unwrap_or("unknown");
+
+                if let Some(quotas) = &entitlement.quotas {
+                    let limit = quotas
+                        .limits
+                        .as_ref()
+                        .and_then(|l| l.premium_interactions);
+                    let remaining = quotas
+                        .remaining
+                        .as_ref()
+                        .and_then(|r| r.premium_interactions);
+                    let pct = quotas
+                        .remaining
+                        .as_ref()
+                        .and_then(|r| r.premium_interactions_percentage);
+                    let reset = quotas.reset_date.as_deref().unwrap_or("unknown");
+                    let overages = quotas.overages_enabled.unwrap_or(false);
+
+                    println!("Copilot Premium Requests");
+                    println!("  Plan:      {plan}");
+                    if let (Some(rem), Some(lim)) = (remaining, limit) {
+                        let used = lim.saturating_sub(rem);
+                        println!("  Used:      {used} / {lim}");
+                    }
+                    if let Some(rem) = remaining {
+                        if let Some(p) = pct {
+                            println!("  Remaining: {rem} ({p:.1}%)");
+                        } else {
+                            println!("  Remaining: {rem}");
+                        }
+                    }
+                    println!("  Resets:    {reset}");
+                    println!(
+                        "  Overages:  {}",
+                        if overages { "enabled" } else { "disabled" }
+                    );
+                } else {
+                    println!("Plan: {plan}");
+                    println!("No quota information available.");
+                }
             }
         }
     }
