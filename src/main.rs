@@ -29,9 +29,9 @@ enum Commands {
         #[arg(short, long, default_value_t = false)]
         all: bool,
 
-        /// Include full details (diff hunks, review info, line positions, etc.)
+        /// Omit extra details and show a brief summary of each comment
         #[arg(short, long, default_value_t = false)]
-        full: bool,
+        short: bool,
     },
 }
 
@@ -41,16 +41,16 @@ enum Commands {
 
 fn get_token() -> Result<String> {
     // 1. GH_TOKEN env var
-    if let Ok(token) = std::env::var("GH_TOKEN") {
-        if !token.is_empty() {
-            return Ok(token);
-        }
+    if let Ok(token) = std::env::var("GH_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(token);
     }
     // 2. GITHUB_TOKEN env var
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            return Ok(token);
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        return Ok(token);
     }
     // 3. gh auth token
     let output = Command::new("gh")
@@ -339,9 +339,6 @@ struct GqlReview {
 struct SummaryThread {
     path: String,
     line: Option<u64>,
-    start_line: Option<u64>,
-    is_resolved: bool,
-    is_outdated: bool,
     comments: Vec<SummaryComment>,
 }
 
@@ -399,9 +396,6 @@ fn to_summary(thread: &GqlReviewThread) -> SummaryThread {
     SummaryThread {
         path: thread.path.clone(),
         line: thread.line,
-        start_line: thread.start_line,
-        is_resolved: thread.is_resolved,
-        is_outdated: thread.is_outdated,
         comments: thread
             .comments
             .nodes
@@ -432,10 +426,7 @@ fn to_full(thread: &GqlReviewThread) -> FullThread {
         diff_side: thread.diff_side.clone(),
         start_diff_side: thread.start_diff_side.clone(),
         subject_type: thread.subject_type.clone(),
-        resolved_by: thread
-            .resolved_by
-            .as_ref()
-            .map(|a| a.login.clone()),
+        resolved_by: thread.resolved_by.as_ref().map(|a| a.login.clone()),
         comments: thread
             .comments
             .nodes
@@ -459,14 +450,8 @@ fn to_full(thread: &GqlReviewThread) -> FullThread {
                 original_line: c.original_line,
                 original_start_line: c.original_start_line,
                 reply_to_id: c.reply_to.as_ref().and_then(|r| r.database_id),
-                review_state: c
-                    .pull_request_review
-                    .as_ref()
-                    .and_then(|r| r.state.clone()),
-                review_body: c
-                    .pull_request_review
-                    .as_ref()
-                    .and_then(|r| r.body.clone()),
+                review_state: c.pull_request_review.as_ref().and_then(|r| r.state.clone()),
+                review_body: c.pull_request_review.as_ref().and_then(|r| r.body.clone()),
                 review_author: c
                     .pull_request_review
                     .as_ref()
@@ -487,12 +472,12 @@ async fn fetch_review_threads(
     owner: &str,
     repo: &str,
     pr: u64,
-    full: bool,
+    short: bool,
 ) -> Result<Vec<GqlReviewThread>> {
-    let query = if full {
-        REVIEW_THREADS_QUERY_FULL
-    } else {
+    let query = if short {
         REVIEW_THREADS_QUERY_SUMMARY
+    } else {
+        REVIEW_THREADS_QUERY_FULL
     };
 
     let mut all_threads = Vec::new();
@@ -526,8 +511,10 @@ async fn fetch_review_threads(
             bail!("GitHub API returned {status}: {text}");
         }
 
-        let gql: GqlResponse =
-            resp.json().await.context("Failed to parse GraphQL response")?;
+        let gql: GqlResponse = resp
+            .json()
+            .await
+            .context("Failed to parse GraphQL response")?;
 
         if let Some(errors) = gql.errors {
             let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
@@ -558,11 +545,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Comments {
-            pr,
-            all,
-            full,
-        } => {
+        Commands::Comments { pr, all, short } => {
             let (resolved_owner, resolved_repo) = match (cli.owner, cli.repo) {
                 (Some(o), Some(r)) => (o, r),
                 (None, None) => parse_owner_repo_from_remote()?,
@@ -573,25 +556,22 @@ async fn main() -> Result<()> {
             let client = reqwest::Client::new();
 
             let all_threads =
-                fetch_review_threads(&client, &token, &resolved_owner, &resolved_repo, pr, full)
+                fetch_review_threads(&client, &token, &resolved_owner, &resolved_repo, pr, short)
                     .await?;
 
             let threads: Vec<_> = if all {
                 all_threads
             } else {
-                all_threads
-                    .into_iter()
-                    .filter(|t| !t.is_resolved)
-                    .collect()
+                all_threads.into_iter().filter(|t| !t.is_resolved).collect()
             };
 
-            if full {
-                let output: Vec<_> = threads.iter().map(to_full).collect();
+            if short {
+                let output: Vec<_> = threads.iter().map(to_summary).collect();
                 let json =
                     serde_json::to_string_pretty(&output).expect("Failed to serialize to JSON");
                 println!("{json}");
             } else {
-                let output: Vec<_> = threads.iter().map(to_summary).collect();
+                let output: Vec<_> = threads.iter().map(to_full).collect();
                 let json =
                     serde_json::to_string_pretty(&output).expect("Failed to serialize to JSON");
                 println!("{json}");
@@ -626,8 +606,7 @@ mod tests {
 
     #[test]
     fn test_parse_https_url() {
-        let (owner, repo) =
-            parse_owner_repo("https://github.com/lkurcak/ghelpr.git").unwrap();
+        let (owner, repo) = parse_owner_repo("https://github.com/lkurcak/ghelpr.git").unwrap();
         assert_eq!(owner, "lkurcak");
         assert_eq!(repo, "ghelpr");
     }

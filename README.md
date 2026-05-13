@@ -22,13 +22,13 @@ or download a prebuilt binary from [GitHub Releases](https://github.com/lkurcak/
 ## Usage
 
 ```
-ghelpr [-o <owner>] [-r <repo>] comments <pr> [-a] [-f]
+ghelpr [-o <owner>] [-r <repo>] comments <pr> [-a] [-s]
 ```
 
-Returns review threads as JSON. By default, only unresolved threads are shown with a summary of each comment.
+Returns review threads as JSON. By default, only unresolved threads are shown with full details for each comment.
 
 - `-a`, `--all` - include resolved threads
-- `-f`, `--full` - include full details (diff hunks, review state, line positions, etc.)
+- `-s`, `--short` - omit extra details and show a brief summary of each comment
 - `-o`, `--owner` - repository owner (inferred from git remote if omitted)
 - `-r`, `--repo` - repository name (inferred from git remote if omitted)
 
