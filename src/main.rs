@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "ghelpr", about = "GitHub PR helper")]
+#[command(name = "ghelpr", about = "GitHub PR helper", version)]
 struct Cli {
     /// Repository owner (inferred from git remote if omitted)
     #[arg(short, long, global = true)]
