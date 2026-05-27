@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
 use std::process::Command;
+use tabled::{Table, Tabled, settings::Style};
 
 #[derive(Parser)]
 #[command(name = "ghelpr", about = "GitHub PR helper", version)]
@@ -20,10 +21,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show review comments for a pull request
+    /// Show review comments for a pull request (omit PR number to list open PRs)
     Comments {
-        /// Pull request number
-        pr: u64,
+        /// Pull request number (omit to list open PRs)
+        pr: Option<u64>,
 
         /// Include all comments (resolved and unresolved)
         #[arg(short, long, default_value_t = false)]
@@ -211,6 +212,27 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
 }
 "#;
 
+const OPEN_PRS_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(first: 30, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}, after: $cursor) {
+      nodes {
+        number
+        title
+        author { login }
+        updatedAt
+        headRefName
+        isDraft
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}
+"#;
+
 // ---------------------------------------------------------------------------
 // GraphQL response types (full, superset - optional fields handle both modes)
 // ---------------------------------------------------------------------------
@@ -228,19 +250,65 @@ struct GqlError {
 
 #[derive(Deserialize, Debug)]
 struct GqlData {
-    repository: GqlRepository,
+    repository: Option<GqlRepository>,
 }
 
 #[derive(Deserialize, Debug)]
 struct GqlRepository {
     #[serde(rename = "pullRequest")]
-    pull_request: GqlPullRequest,
+    pull_request: Option<GqlPullRequest>,
 }
 
 #[derive(Deserialize, Debug)]
 struct GqlPullRequest {
     #[serde(rename = "reviewThreads")]
     review_threads: GqlConnection<GqlReviewThread>,
+}
+
+// -- Response types for listing open PRs --
+
+#[derive(Deserialize, Debug)]
+struct GqlOpenPrsResponse {
+    data: Option<GqlOpenPrsData>,
+    errors: Option<Vec<GqlError>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GqlOpenPrsData {
+    repository: Option<GqlOpenPrsRepository>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GqlOpenPrsRepository {
+    #[serde(rename = "pullRequests")]
+    pull_requests: GqlConnection<GqlOpenPr>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GqlOpenPr {
+    number: u64,
+    title: String,
+    author: Option<GqlAuthor>,
+    #[serde(rename = "updatedAt")]
+    #[allow(dead_code)]
+    updated_at: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "isDraft")]
+    #[allow(dead_code)]
+    is_draft: bool,
+}
+
+#[derive(Tabled)]
+struct PrRow {
+    #[tabled(rename = "#")]
+    number: u64,
+    #[tabled(rename = "Title")]
+    title: String,
+    #[tabled(rename = "Author")]
+    author: String,
+    #[tabled(rename = "Branch")]
+    branch: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -522,7 +590,13 @@ async fn fetch_review_threads(
         }
 
         let data = gql.data.context("No data in GraphQL response")?;
-        let threads = data.repository.pull_request.review_threads;
+        let repository = data
+            .repository
+            .with_context(|| format!("Repository '{owner}/{repo}' not found"))?;
+        let pull_request = repository
+            .pull_request
+            .with_context(|| format!("Pull request #{pr} not found in {owner}/{repo}"))?;
+        let threads = pull_request.review_threads;
 
         all_threads.extend(threads.nodes);
 
@@ -534,6 +608,56 @@ async fn fetch_review_threads(
     }
 
     Ok(all_threads)
+}
+
+async fn fetch_open_prs(
+    client: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<GqlOpenPr>> {
+    let variables = serde_json::json!({
+        "owner": owner,
+        "repo": repo,
+        "cursor": null,
+    });
+
+    let body = serde_json::json!({
+        "query": OPEN_PRS_QUERY,
+        "variables": variables,
+    });
+
+    let resp = client
+        .post("https://api.github.com/graphql")
+        .bearer_auth(token)
+        .header("User-Agent", "ghelpr")
+        .json(&body)
+        .send()
+        .await
+        .context("GraphQL request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("GitHub API returned {status}: {text}");
+    }
+
+    let gql: GqlOpenPrsResponse = resp
+        .json()
+        .await
+        .context("Failed to parse GraphQL response")?;
+
+    if let Some(errors) = gql.errors {
+        let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+        bail!("GraphQL errors: {}", msgs.join("; "));
+    }
+
+    let data = gql.data.context("No data in GraphQL response")?;
+    let repository = data
+        .repository
+        .with_context(|| format!("Repository '{owner}/{repo}' not found"))?;
+
+    Ok(repository.pull_requests.nodes)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +678,33 @@ async fn main() -> Result<()> {
 
             let token = get_token()?;
             let client = reqwest::Client::new();
+
+            let pr = match pr {
+                Some(n) => n,
+                None => {
+                    let prs =
+                        fetch_open_prs(&client, &token, &resolved_owner, &resolved_repo).await?;
+                    if prs.is_empty() {
+                        println!("No open pull requests in {resolved_owner}/{resolved_repo}.");
+                        return Ok(());
+                    }
+                    let rows: Vec<PrRow> = prs
+                        .iter()
+                        .map(|pr| PrRow {
+                            number: pr.number,
+                            title: pr.title.clone(),
+                            author: pr
+                                .author
+                                .as_ref()
+                                .map(|a| a.login.clone())
+                                .unwrap_or_else(|| "ghost".into()),
+                            branch: pr.head_ref_name.clone(),
+                        })
+                        .collect();
+                    println!("{}", Table::new(rows).with(Style::blank()));
+                    return Ok(());
+                }
+            };
 
             let all_threads =
                 fetch_review_threads(&client, &token, &resolved_owner, &resolved_repo, pr, short)

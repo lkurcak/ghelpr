@@ -1,6 +1,6 @@
 [package]
 name = "ghelpr"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "CLI tool for working with GitHub pull requests"
 license = "MIT"
@@ -13,3 +13,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+tabled = "0.20"

@@ -22,10 +22,12 @@ or download a prebuilt binary from [GitHub Releases](https://github.com/lkurcak/
 ## Usage
 
 ```
-ghelpr [-o <owner>] [-r <repo>] comments <pr> [-a] [-s]
+ghelpr [-o <owner>] [-r <repo>] comments [<pr>] [-a] [-s]
 ```
 
-Returns review threads as JSON. By default, only unresolved threads are shown with full details for each comment.
+When `<pr>` is omitted, lists open pull requests sorted by most recently updated.
+
+When `<pr>` is provided, returns review threads as JSON. By default, only unresolved threads are shown with full details for each comment.
 
 - `-a`, `--all` - include resolved threads
 - `-s`, `--short` - omit extra details and show a brief summary of each comment
